@@ -1,0 +1,101 @@
+import pandas as pd
+from pyzabbix import ZabbixAPI
+import logging
+
+# --- Log Yönetimi ---
+# İşlemlerin takibi ve hata ayıklama için standart logging yapılandırması.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Yapılandırma Ayarları ---
+# Güvenlik nedeniyle URL ve Token bilgilerini ortam değişkenlerinden veya güvenli kasalardan almanız önerilir.
+ZABBIX_SERVER_URL = "http://YOUR_ZABBIX_IP/api_jsonrpc.php"
+ZABBIX_API_TOKEN = "YOUR_SECRET_API_TOKEN"
+
+CSV_FILE_PATH = "cihaz_listesi.csv"
+CSV_DELIMITER = ";"  # Excel dışa aktarımları genellikle ';' kullanır.
+
+# --- SNMPv3 Güvenlik Ayarları ---
+SNMP_CONFIG = {
+    "version": 3,
+    "bulk": 1,
+    "securityname": "v3_user",
+    "securitylevel": 2,      # 2: authPriv (En yüksek güvenlik seviyesi)
+    "authprotocol": 0,       # 0: MD5, 1: SHA1
+    "authpassphrase": "AUTH_PASSWORD", 
+    "privprotocol": 0,       # 0: DES, 1: AES
+    "privpassphrase": "PRIV_PASSWORD",
+    "contextname": ""
+}
+
+def get_zabbix_connection():
+    """Zabbix API bağlantısını başlatır."""
+    try:
+        zapi = ZabbixAPI(ZABBIX_SERVER_URL, timeout=15)
+        zapi.login(api_token=ZABBIX_API_TOKEN)
+        logger.info(f"Zabbix bağlantısı kuruldu.")
+        return zapi
+    except Exception as e:
+        logger.error(f"Bağlantı hatası: {e}")
+        raise
+
+def sanitize_name(text):
+    """Zabbix uyumluluğu için metindeki Türkçe karakterleri temizler."""
+    chars = {'ş':'s','Ş':'S','ı':'i','İ':'I','ğ':'g','Ğ':'G','ü':'u','Ü':'U','ö':'o','Ö':'O','ç':'c','Ç':'C'}
+    for tr, eng in chars.items():
+        text = text.replace(tr, eng)
+    return text.replace(" ", "-").replace(".", "")
+
+def run_import():
+    zapi = get_zabbix_connection()
+    
+    # CSV dosyasını Pandas ile oku
+    df = pd.read_csv(CSV_FILE_PATH, delimiter=CSV_DELIMITER, encoding="utf-8-sig")
+    
+    # Hedef Grup ve Şablon ID'lerini al
+    # (Bu kısımlar zapi.hostgroup.get ve zapi.template.get ile dinamik hale getirilir)
+    group_id = "15" # Örnek ID
+    template_id = "10106" # Örnek ID (Cisco IOS SNMP)
+
+    for _, row in df.iterrows():
+        try:
+            raw_name = str(row['Caption'])
+            ip_addr = str(row['IP_Address'])
+            
+            # Host adı temizleme ve hazırlık
+            clean_name = sanitize_name(raw_name)
+            
+            # Dinamik Tag (Etiket) Oluşturma
+            tags = [
+                {"tag": "City", "value": str(row.get('İl', ''))},
+                {"tag": "Company", "value": "Kurum_Adi"},
+                {"tag": "Environment", "value": "Production"}
+            ]
+
+            # Host sistemde var mı?
+            exists = zapi.host.get(filter={"host": clean_name})
+
+            if exists:
+                # Güncelleme mantığı
+                zapi.host.update(hostid=exists[0]['hostid'], tags=tags)
+                logger.info(f"Güncellendi: {clean_name}")
+            else:
+                # Yeni Host Oluşturma (SNMPv3 Arayüzü ile)
+                zapi.host.create(
+                    host=clean_name,
+                    name=raw_name,
+                    interfaces=[{
+                        "type": 2, "main": 1, "useip": 1, "ip": ip_addr,
+                        "port": "161", "details": SNMP_CONFIG
+                    }],
+                    groups=[{"groupid": group_id}],
+                    templates=[{"templateid": template_id}],
+                    tags=tags
+                )
+                logger.info(f"Oluşturuldu: {clean_name}")
+
+        except Exception as e:
+            logger.error(f"İşlem hatası ({raw_name}): {e}")
+
+if __name__ == "__main__":
+    run_import()
