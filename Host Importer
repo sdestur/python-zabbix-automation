@@ -3,99 +3,127 @@ from pyzabbix import ZabbixAPI
 import logging
 
 # --- Log Yönetimi ---
-# İşlemlerin takibi ve hata ayıklama için standart logging yapılandırması.
+# İşlemlerin takibi için çıktı formatını ayarlıyoruz. 
+# Hangi cihazda hata olduğunu buradan izleyebilirsiniz.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Yapılandırma Ayarları ---
-# Güvenlik nedeniyle URL ve Token bilgilerini ortam değişkenlerinden veya güvenli kasalardan almanız önerilir.
-ZABBIX_SERVER_URL = "http://YOUR_ZABBIX_IP/api_jsonrpc.php"
-ZABBIX_API_TOKEN = "YOUR_SECRET_API_TOKEN"
+# --- Zabbix Erişim Bilgileri ---
+# URL: Zabbix arayüzüne girdiğiniz adresin sonuna '/api_jsonrpc.php' ekleyerek yazın.
+# Token: Profil ayarlarınızdan (User Settings -> API Tokens) oluşturduğunuz anahtarı buraya girin.
+ZABBIX_SERVER_URL = "http://ZABBIX_IP_ADRESINIZ/api_jsonrpc.php"
+ZABBIX_API_TOKEN = "BURAYA_API_TOKEN_GELECEK"
 
-CSV_FILE_PATH = "cihaz_listesi.csv"
-CSV_DELIMITER = ";"  # Excel dışa aktarımları genellikle ';' kullanır.
+# --- Dosya ve Veri Ayarları ---
+CSV_FILE_PATH = "envanter_listesi.csv"
+CSV_DELIMITER = ";"  # Excel'den CSV'ye aktarırken genellikle noktalı virgül kullanılır.
 
-# --- SNMPv3 Güvenlik Ayarları ---
+# --- SNMP Yapılandırması ---
+# Bu ayarlar Zabbix'te Host eklerken "Interfaces" sekmesindeki SNMP alanına karşılık gelir.
+# Versiyon 1, 2c veya 3 tercihinize göre aşağıdaki sözlüğü güncelleyebilirsiniz.
 SNMP_CONFIG = {
-    "version": 3,
-    "bulk": 1,
-    "securityname": "v3_user",
-    "securitylevel": 2,      # 2: authPriv (En yüksek güvenlik seviyesi)
-    "authprotocol": 0,       # 0: MD5, 1: SHA1
-    "authpassphrase": "AUTH_PASSWORD", 
-    "privprotocol": 0,       # 0: DES, 1: AES
-    "privpassphrase": "PRIV_PASSWORD",
+    "version": 3,            # SNMP Versiyonu (1, 2 veya 3)
+    "bulk": 1,               # GetBulk isteklerini etkinleştir (Önerilen: 1)
+    "securityname": "v3_kullanici", # SNMPv3 Kullanıcı Adı
+    "securitylevel": 2,      # 0: noAuthNoPriv, 1: authNoPriv, 2: authPriv (En güvenli)
+    "authprotocol": 0,       # 0: MD5, 1: SHA1, 2: SHA224...
+    "authpassphrase": "KIMLIK_DOGRULAMA_SIFRESI", 
+    "privprotocol": 0,       # 0: DES, 1: AES128...
+    "privpassphrase": "SIFRELEME_ANAHTARI",
     "contextname": ""
 }
 
 def get_zabbix_connection():
-    """Zabbix API bağlantısını başlatır."""
+    """Zabbix API ile güvenli bağlantı kurar."""
     try:
         zapi = ZabbixAPI(ZABBIX_SERVER_URL, timeout=15)
         zapi.login(api_token=ZABBIX_API_TOKEN)
-        logger.info(f"Zabbix bağlantısı kuruldu.")
+        logger.info(f"Zabbix Sunucusuna Bağlanıldı: {ZABBIX_SERVER_URL}")
         return zapi
     except Exception as e:
-        logger.error(f"Bağlantı hatası: {e}")
+        logger.error(f"Bağlantı sırasında bir hata oluştu: {e}")
         raise
 
 def sanitize_name(text):
-    """Zabbix uyumluluğu için metindeki Türkçe karakterleri temizler."""
-    chars = {'ş':'s','Ş':'S','ı':'i','İ':'I','ğ':'g','Ğ':'G','ü':'u','Ü':'U','ö':'o','Ö':'O','ç':'c','Ç':'C'}
-    for tr, eng in chars.items():
+    """
+    Zabbix host adlarında Türkçe karakter veya boşluk kabul etmez. 
+    Bu fonksiyon isimleri Zabbix'in seveceği formata getirir.
+    """
+    karakter_haritasi = {
+        'ş':'s','Ş':'S','ı':'i','İ':'I','ğ':'g','Ğ':'G',
+        'ü':'u','Ü':'U','ö':'o','Ö':'O','ç':'c','Ç':'C'
+    }
+    for tr, eng in karakter_haritasi.items():
         text = text.replace(tr, eng)
-    return text.replace(" ", "-").replace(".", "")
+    return text.replace(" ", "-").replace(".", "").strip()
 
 def run_import():
+    """Ana içe aktarma süreci."""
     zapi = get_zabbix_connection()
     
-    # CSV dosyasını Pandas ile oku
-    df = pd.read_csv(CSV_FILE_PATH, delimiter=CSV_DELIMITER, encoding="utf-8-sig")
-    
-    # Hedef Grup ve Şablon ID'lerini al
-    # (Bu kısımlar zapi.hostgroup.get ve zapi.template.get ile dinamik hale getirilir)
-    group_id = "15" # Örnek ID
-    template_id = "10106" # Örnek ID (Cisco IOS SNMP)
+    # CSV dosyasını bellek üzerine alıyoruz
+    try:
+        df = pd.read_csv(CSV_FILE_PATH, delimiter=CSV_DELIMITER, encoding="utf-8-sig")
+    except FileNotFoundError:
+        logger.error(f"Hata: '{CSV_FILE_PATH}' dosyası bulunamadı!")
+        return
 
-    for _, row in df.iterrows():
+    # ÖNEMLİ: Aşağıdaki ID'leri kendi Zabbix sisteminizden almalısınız.
+    # Host Group ID ve Template ID değerlerini Zabbix URL'sinden görebilirsiniz.
+    HEDEF_GRUP_ID = "15"     # Örn: Network Cihazları Grubu
+    SABLON_ID = "10106"      # Örn: 'Cisco IOS by SNMP' şablonu
+
+    for index, row in df.iterrows():
         try:
-            raw_name = str(row['Caption'])
-            ip_addr = str(row['IP_Address'])
+            # CSV'deki sütun başlıklarını buraya tanımlayın
+            cihaz_adi = str(row['Caption'])
+            ip_adresi = str(row['IP_Address'])
             
-            # Host adı temizleme ve hazırlık
-            clean_name = sanitize_name(raw_name)
+            temiz_isim = sanitize_name(cihaz_adi)
             
-            # Dinamik Tag (Etiket) Oluşturma
-            tags = [
-                {"tag": "City", "value": str(row.get('İl', ''))},
-                {"tag": "Company", "value": "Kurum_Adi"},
-                {"tag": "Environment", "value": "Production"}
+            # Dinamik Etiketler (Tags): Zabbix arayüzündeki 'Tags' sekmesi.
+            # Raporlama ve Dashboard oluştururken hayat kurtarır.
+            etiketler = [
+                {"tag": "Sehir", "value": str(row.get('İl', 'Belirtilmedi'))},
+                {"tag": "Departman", "value": str(row.get('Departman', 'BT'))},
+                {"tag": "Otomasyon", "value": "Python-API"}
             ]
 
-            # Host sistemde var mı?
-            exists = zapi.host.get(filter={"host": clean_name})
+            # Sistemde bu isimle bir cihaz var mı kontrol et?
+            mevcut_host = zapi.host.get(filter={"host": temiz_isim})
 
-            if exists:
-                # Güncelleme mantığı
-                zapi.host.update(hostid=exists[0]['hostid'], tags=tags)
-                logger.info(f"Güncellendi: {clean_name}")
-            else:
-                # Yeni Host Oluşturma (SNMPv3 Arayüzü ile)
-                zapi.host.create(
-                    host=clean_name,
-                    name=raw_name,
-                    interfaces=[{
-                        "type": 2, "main": 1, "useip": 1, "ip": ip_addr,
-                        "port": "161", "details": SNMP_CONFIG
-                    }],
-                    groups=[{"groupid": group_id}],
-                    templates=[{"templateid": template_id}],
-                    tags=tags
+            if mevcut_host:
+                # Cihaz varsa sadece etiketleri ve şablonu güncelle (Update)
+                zapi.host.update(
+                    hostid=mevcut_host[0]['hostid'], 
+                    tags=etiketler
                 )
-                logger.info(f"Oluşturuldu: {clean_name}")
+                logger.info(f"MEVCUT GÜNCELLENDİ: {temiz_isim}")
+            else:
+                # Cihaz yoksa sıfırdan oluştur (Create)
+                # 'interfaces' kısmı cihazın hangi IP ve SNMP ayarıyla izleneceğini belirler.
+                zapi.host.create(
+                    host=temiz_isim,
+                    name=cihaz_adi, # Arayüzde görünecek 'Visible Name'
+                    interfaces=[{
+                        "type": 2,      # 2 numaralı tip SNMP arayüzünü temsil eder
+                        "main": 1, 
+                        "useip": 1, 
+                        "ip": ip_adresi,
+                        "port": "161", 
+                        "details": SNMP_CONFIG # Yukarıdaki SNMPv3 ayarlarını basar
+                    }],
+                    groups=[{"groupid": HEDEF_GRUP_ID}],
+                    templates=[{"templateid": SABLON_ID}],
+                    tags=etiketler,
+                    inventory_mode=1 # Envanter verisini otomatik doldurmayı açar
+                )
+                logger.info(f"YENİ OLUŞTURULDU: {temiz_isim} ({ip_adresi})")
 
         except Exception as e:
-            logger.error(f"İşlem hatası ({raw_name}): {e}")
+            logger.error(f"Satır {index} işlenirken hata oluştu ({cihaz_adi}): {e}")
 
 if __name__ == "__main__":
+    logger.info("Zabbix içe aktarma işlemi başlıyor...")
     run_import()
+    logger.info("İşlem tamamlandı.")
